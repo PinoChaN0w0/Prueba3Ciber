@@ -2,29 +2,41 @@
 @file app.py
 @brief "Sistema Alumnos" de SecureDev: API y portal web de alumnos (Evaluación Parcial 3, OCY1102).
 
-Además de las rutas de negocio, la app publica métricas para Prometheus en /metrics.
-Las métricas de seguridad (logins fallidos y peticiones sospechosas) se ven en Grafana.
+Versión endurecida (hardened): mitiga SQLi, XSS reflejado, CSRF, fuerza bruta,
+gestión insegura de credenciales/secretos, modo debug y cabeceras HTTP faltantes.
 """
-import hashlib
+import hmac
 import os
 import re
+import secrets
 import sqlite3
 import time
 
-from flask import Flask, Response, g, jsonify, render_template_string, request
+from flask import Flask, Response, g, jsonify, render_template_string, request, session
+from markupsafe import escape
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
 
-## Clave de la aplicación y credenciales del administrador.
-SECRET_KEY = "SecureDev-2024-clave-super-secreta"
-ADMIN_USUARIO = "admin"
-ADMIN_CLAVE_MD5 = "21232f297a57a5a743894a0e4a801fc3"
-app.config["SECRET_KEY"] = SECRET_KEY
+## Clave de sesión dinámica (sin secretos en el código) y cookies endurecidas.
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
-## Versión desplegada: la inyecta el pipeline (1.0.<build>+<commit>). Sirve para la trazabilidad.
+## Credenciales de administrador con hash robusto (scrypt/PBKDF2) sin contraseñas hardcoded.
+ADMIN_USUARIO = os.environ.get("ADMIN_USUARIO", "admin")
+ADMIN_CLAVE_HASH = os.environ.get("ADMIN_PASSWORD_HASH") or generate_password_hash(
+    os.environ.get("ADMIN_PASSWORD") or secrets.token_urlsafe(24)
+)
+
+## Control de tasa (rate limiting) para mitigar fuerza bruta en /login.
+INTENTOS_LOGIN = {}
+MAX_INTENTOS_LOGIN = 5
+VENTANA_LOGIN_SEG = 60
+
+## Versión desplegada: la inyecta el pipeline (1.0.<build>+<commit>).
 VERSION = os.environ.get("APP_VERSION", "dev")
-## Archivo SQLite con los alumnos (cada entorno usa el suyo).
 DB_PATH = os.environ.get("DB_PATH", "alumnos.db")
 
 ALUMNOS_INICIALES = [
@@ -43,7 +55,7 @@ SOSPECHOSAS = Counter("peticiones_sospechosas_total", "Peticiones con patrones d
 APP_INFO = Gauge("app_info", "Versión desplegada de la aplicación", ["version"])
 APP_INFO.labels(version=VERSION).set(1)
 
-## Patrones que delatan un intento de ataque (detección, no bloqueo).
+## Patrones que delatan un intento de ataque (observabilidad en Prometheus/Grafana).
 PATRONES_ATAQUE = {
     "xss": re.compile(r"<\s*script|javascript:|onerror\s*=|onload\s*=|<\s*img", re.I),
     "sqli": re.compile(r"('|%27)\s*(or|and|union)\b|union\s+select|--|;\s*drop\b|sleep\(", re.I),
@@ -67,6 +79,7 @@ PORTADA = """<!doctype html>
 </form>
 <h2>Acceso administrador</h2>
 <form action="/login" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <input name="usuario" value="admin"> <input name="clave" type="password" value="">
   <button type="submit">Entrar</button>
 </form>
@@ -124,10 +137,20 @@ def antes_de_la_peticion():
 @app.after_request
 def despues_de_la_peticion(respuesta):
     """!
-    @brief Registra la métrica de cada petición atendida.
+    @brief Agrega cabeceras de seguridad HTTP y registra métricas de cada petición.
     @param respuesta Respuesta que Flask enviará al cliente.
-    @return La misma respuesta.
+    @return Respuesta endurecida con cabeceras de seguridad.
     """
+    respuesta.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; "
+        "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    )
+    respuesta.headers["X-Content-Type-Options"] = "nosniff"
+    respuesta.headers["X-Frame-Options"] = "DENY"
+    respuesta.headers["Referrer-Policy"] = "no-referrer"
+    respuesta.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    respuesta.headers["Server"] = "SecureDev"
+
     endpoint = request.url_rule.rule if request.url_rule else "desconocido"
     if endpoint != "/metrics":
         HTTP_PETICIONES.labels(request.method, endpoint, str(respuesta.status_code)).inc()
@@ -138,19 +161,21 @@ def despues_de_la_peticion(respuesta):
 @app.route("/")
 def portada():
     """!
-    @brief Portada HTML con enlaces y formularios del sistema.
+    @brief Portada HTML con enlaces, formularios y token anti-CSRF.
     @return Página HTML.
     """
-    return render_template_string(PORTADA, version=VERSION)
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+    return render_template_string(PORTADA, version=VERSION, csrf_token=session["csrf_token"])
 
 
 @app.route("/hello")
 def hello():
     """!
-    @brief Saluda al usuario cuyo nombre llega en el parámetro de URL «name».
-    @return Página HTML con el saludo.
+    @brief Saluda al usuario escapando caracteres HTML para prevenir XSS reflejado.
+    @return Página HTML segura con el saludo.
     """
-    name = request.args.get("name", "visitante")
+    name = escape(request.args.get("name", "visitante"))
     return f"<h1>Hola, {name}!</h1>"
 
 
@@ -198,31 +223,51 @@ def obtener_alumno(alumno_id):
 @app.route("/alumnos/buscar")
 def buscar_alumnos():
     """!
-    @brief Busca alumnos cuyo nombre contenga el texto del parámetro «nombre».
+    @brief Busca alumnos mediante consulta parametrizada (mitiga SQL Injection).
     @return JSON con los alumnos encontrados.
     """
     nombre = request.args.get("nombre", "")
-    consulta = f"SELECT * FROM alumnos WHERE nombre LIKE '%{nombre}%'"
     try:
-        filas = conectar().execute(consulta).fetchall()
-    except sqlite3.Error as error:
-        return jsonify({"error": str(error), "consulta": consulta}), 500
+        filas = conectar().execute(
+            "SELECT * FROM alumnos WHERE nombre LIKE ?",
+            (f"%{nombre}%",),
+        ).fetchall()
+    except sqlite3.Error:
+        return jsonify({"error": "Error al consultar alumnos"}), 500
     return jsonify([dict(f) for f in filas])
 
 
 @app.route("/login", methods=["POST"])
 def login():
     """!
-    @brief Valida las credenciales del administrador enviadas por formulario.
-    @return JSON con el resultado; 401 si las credenciales no son válidas.
+    @brief Valida token anti-CSRF, límite de intentos y credenciales con hash seguro.
+    @return JSON con el resultado; 403 por CSRF inválido, 429 por fuerza bruta, 401 por credenciales inválidas.
     """
+    token_esperado = session.get("csrf_token", "")
+    token_enviado = request.form.get("csrf_token", "")
+    if not token_esperado or not hmac.compare_digest(token_enviado, token_esperado):
+        LOGIN_FALLIDOS.inc()
+        return jsonify({"error": "Token CSRF inválido o ausente"}), 403
+
+    ip = request.remote_addr or "desconocido"
+    ahora = time.time()
+    recientes = [t for t in INTENTOS_LOGIN.get(ip, []) if ahora - t < VENTANA_LOGIN_SEG]
+    if len(recientes) >= MAX_INTENTOS_LOGIN:
+        INTENTOS_LOGIN[ip] = recientes
+        LOGIN_FALLIDOS.inc()
+        return jsonify({"error": "Demasiados intentos fallidos. Intente más tarde."}), 429
+
     usuario = request.form.get("usuario", "")
     clave = request.form.get("clave", "")
-    if usuario == ADMIN_USUARIO and hashlib.md5(clave.encode()).hexdigest() == ADMIN_CLAVE_MD5:
+    if hmac.compare_digest(usuario, ADMIN_USUARIO) and check_password_hash(ADMIN_CLAVE_HASH, clave):
+        INTENTOS_LOGIN.pop(ip, None)
         LOGIN_EXITOSOS.inc()
         return jsonify({"mensaje": "Bienvenido, administrador"})
+
+    recientes.append(ahora)
+    INTENTOS_LOGIN[ip] = recientes
     LOGIN_FALLIDOS.inc()
-    app.logger.warning("Login fallido para el usuario '%s' desde %s", usuario, request.remote_addr)
+    app.logger.warning("Login fallido para el usuario '%s' desde %s", usuario, ip)
     return jsonify({"error": "Credenciales inválidas"}), 401
 
 
@@ -238,4 +283,4 @@ def metrics():
 iniciar_db()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host=os.environ.get("HOST", "127.0.0.1"), port=5000, debug=False)
