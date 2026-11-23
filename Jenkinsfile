@@ -1,17 +1,20 @@
-$jf = @'
 pipeline {
     agent any
+
     options {
         timestamps()
         timeout(time: 40, unit: 'MINUTES')
         disableConcurrentBuilds()
     }
+
     triggers {
         pollSCM('H/3 * * * *')
     }
+
     environment {
         PIP_DISABLE_PIP_VERSION_CHECK = '1'
     }
+
     stages {
         stage('Build') {
             steps {
@@ -27,6 +30,7 @@ pipeline {
                 sh '.venv/bin/python -m compileall -q app.py'
             }
         }
+
         stage('Test') {
             steps {
                 sh '.venv/bin/python -m pytest --junitxml=reports/junit.xml'
@@ -37,6 +41,7 @@ pipeline {
                 }
             }
         }
+
         stage('Security Review (SAST)') {
             steps {
                 catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
@@ -48,6 +53,7 @@ pipeline {
                 }
             }
         }
+
         stage('Dependency Management') {
             steps {
                 catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
@@ -59,11 +65,13 @@ pipeline {
                 }
             }
         }
+
         stage('Deploy Staging') {
             steps {
                 sh 'bash scripts/deploy.sh staging 5001'
             }
         }
+
         stage('DAST - OWASP ZAP') {
             steps {
                 catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
@@ -71,6 +79,7 @@ pipeline {
                 }
             }
         }
+
         stage('Deploy Producción') {
             when {
                 expression { currentBuild.currentResult == 'SUCCESS' }
@@ -81,6 +90,7 @@ pipeline {
             }
         }
     }
+
     post {
         always {
             withEnv(["RESULTADO=${currentBuild.currentResult}"]) {
@@ -90,7 +100,3 @@ pipeline {
         }
     }
 }
-'@
-git add Jenkinsfile
-git commit -m "Agrega stages de seguridad SAST, SCA, DAST y Quality Gate"
-git push origin main
